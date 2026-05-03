@@ -68,6 +68,8 @@ function publicPlayerInfo(player) {
   return {
     id: player.id,
     name: player.name,
+    color: player.color,
+    initial: player.initial,
     ready: player.ready,
     alive: player.alive,
     stonesAlive: player.alive ? (SHIPS_PER_PLAYER - player.shipsHit.size) : 0,
@@ -89,6 +91,24 @@ function buildRoomStateFor(room, viewerId, viewerKind) {
 
   const pauseEndsAt = room.pauseUntil || null;
 
+  // Welche Felder wurden in der LAUFENDEN Runde schon beschossen (von wem),
+  // OHNE Treffer-Info zu verraten - die kommt erst in der Auflösung.
+  // So sieht man, wo man nicht mehr klicken muss.
+  const roundShots = [];
+  if (room.phase === 'playing') {
+    for (const p of room.players.values()) {
+      if (p.alive && p.shotThisRound) {
+        roundShots.push({
+          shooterId: p.id,
+          shooterName: p.name,
+          shooterColor: p.color,
+          shooterInitial: p.initial,
+          cell: p.shotThisRound
+        });
+      }
+    }
+  }
+
   const base = {
     code: room.code,
     phase: room.phase,
@@ -102,6 +122,7 @@ function buildRoomStateFor(room, viewerId, viewerKind) {
     pausedFor: room.pausedFor || null,
     winner: room.winner || null,
     viewerKind,
+    roundShots,
     lastReveal: room.lastReveal || null  // Auflösung der letzten Runde
   };
 
@@ -141,9 +162,33 @@ function broadcastRoom(room) {
 
 // ===== Spiellogik =====
 
-function newPlayer(id, ws, name) {
+// 10 deutlich unterscheidbare Farben für bis zu 10 Spieler
+const PLAYER_COLORS = [
+  '#7DD3FC', // Hellblau (Akzent)
+  '#FCA5A5', // Rosa-Rot
+  '#86EFAC', // Hellgrün
+  '#FCD34D', // Gelb
+  '#C4B5FD', // Lavendel
+  '#FDBA74', // Orange
+  '#67E8F9', // Cyan
+  '#F9A8D4', // Pink
+  '#FDE68A', // Sandgelb
+  '#A7F3D0'  // Mint
+];
+
+function pickColor(room) {
+  const used = new Set(Array.from(room.players.values()).map(p => p.color));
+  for (const c of PLAYER_COLORS) {
+    if (!used.has(c)) return c;
+  }
+  return PLAYER_COLORS[0];
+}
+
+function newPlayer(id, ws, name, color) {
   return {
     id, ws, name,
+    color: color || PLAYER_COLORS[0],
+    initial: (name || '?').charAt(0).toUpperCase(),
     role: 'player',
     ready: false,
     ships: new Set(),
@@ -219,6 +264,8 @@ function resolveRound(room) {
       shots.push({
         shooterId: p.id,
         shooterName: p.name,
+        shooterColor: p.color,
+        shooterInitial: p.initial,
         cell: p.shotThisRound
       });
     }
@@ -232,13 +279,17 @@ function resolveRound(room) {
   // Sammle Treffer pro Spieler
   const eliminationsThisRound = [];
   for (const shot of shots) {
-    const hits = []; // Liste von {playerName} die getroffen wurden
+    const hits = []; // Liste von {playerName, playerColor} die getroffen wurden
     for (const target of room.players.values()) {
       if (!target.alive) continue;
       if (target.id === shot.shooterId) continue; // sich selbst nicht treffen
       if (target.ships.has(shot.cell) && !target.shipsHit.has(shot.cell)) {
         target.shipsHit.add(shot.cell);
-        hits.push({ playerName: target.name, playerId: target.id });
+        hits.push({
+          playerName: target.name,
+          playerId: target.id,
+          playerColor: target.color
+        });
         // Prüfen ob ausgeschieden
         if (target.shipsHit.size >= SHIPS_PER_PLAYER) {
           target.alive = false;
@@ -247,7 +298,10 @@ function resolveRound(room) {
       }
     }
     reveal.shots.push({
+      shooterId: shot.shooterId,
       shooterName: shot.shooterName,
+      shooterColor: shot.shooterColor,
+      shooterInitial: shot.shooterInitial,
       cell: shot.cell,
       hits,
       hitCount: hits.length
@@ -388,7 +442,7 @@ function handleMessage(ws, msg, ctx) {
       roundStartTime: null,
       lastActivity: Date.now()
     };
-    room.players.set(playerId, newPlayer(playerId, ws, name));
+    room.players.set(playerId, newPlayer(playerId, ws, name, PLAYER_COLORS[0]));
     rooms.set(code, room);
     ctx.id = playerId;
     ctx.kind = 'player';
@@ -472,7 +526,8 @@ function handleMessage(ws, msg, ctx) {
       finalName = `${name} ${suffix}`;
     }
     const id = makeId();
-    room.players.set(id, newPlayer(id, ws, finalName));
+    const color = pickColor(room);
+    room.players.set(id, newPlayer(id, ws, finalName, color));
     ctx.id = id;
     ctx.kind = 'player';
     ctx.code = code;

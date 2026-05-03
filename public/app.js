@@ -69,6 +69,22 @@ function send(type, data = {}) {
   }
 }
 
+// Berechnet die Restzeit relativ zur Server-Zeit (bei Verbindungsaufbau gemerkt)
+// damit Uhr-Drift zwischen Client und Server kompensiert wird.
+let serverTimeOffset = 0; // serverTime - clientTime, positiv wenn Server "in der Zukunft"
+
+function getRoundTimeLeft() {
+  if (!serverState || !serverState.roundEndsAt) return 0;
+  const now = Date.now() + serverTimeOffset;
+  return Math.max(0, serverState.roundEndsAt - now);
+}
+
+function getPauseTimeLeft() {
+  if (!serverState || !serverState.pauseEndsAt) return 0;
+  const now = Date.now() + serverTimeOffset;
+  return Math.max(0, serverState.pauseEndsAt - now);
+}
+
 function onServerMessage(msg) {
   if (msg.type === 'joined') {
     me.id = msg.id;
@@ -82,6 +98,10 @@ function onServerMessage(msg) {
     return;
   }
   if (msg.type === 'state') {
+    // Server-Zeit-Drift kompensieren (kleine Korrektur, falls Client-Uhr schief geht)
+    if (msg.state.serverTime) {
+      serverTimeOffset = msg.state.serverTime - Date.now();
+    }
     serverState = msg.state;
     render();
     return;
@@ -100,6 +120,26 @@ function showToast(text, kind = 'error') {
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 3500);
 }
+
+// Lokaler Countdown-Timer: aktualisiert nur die Countdown-Anzeigen,
+// rendert NICHT das ganze UI neu. Das verhindert das Flackern.
+// Läuft IMMER (auch leer) — viel einfacher als Start/Stop-Logik.
+setInterval(() => {
+  if (!serverState) return;
+
+  // Runde-Countdown
+  document.querySelectorAll('[data-countdown="round"]').forEach(el => {
+    const t = getRoundTimeLeft();
+    el.textContent = fmtTime(t);
+    if (t < 10000) el.classList.add('urgent');
+    else el.classList.remove('urgent');
+  });
+
+  // Pause-Countdown
+  document.querySelectorAll('[data-countdown="pause"]').forEach(el => {
+    el.textContent = fmtTime(getPauseTimeLeft());
+  });
+}, 500);
 
 function leaveRoom() {
   send('leave_room');
@@ -144,21 +184,51 @@ function fmtTime(ms) {
 function render() {
   $app.innerHTML = '';
 
+  // Connection-Status oben rechts (klein) UND großes Banner wenn offline
   const cs = el('div', { class: 'connection-status' });
   cs.innerHTML = connected
     ? `<span class="dot online"></span>VERBUNDEN`
-    : `<span class="dot offline"></span>VERBINDE…`;
+    : `<span class="dot offline"></span>OFFLINE`;
   $app.appendChild(cs);
 
-  if (!connected) { renderConnecting(); return; }
-  if (!serverState) { renderHome(); return; }
+  if (!connected && serverState) {
+    // Großes deutliches Banner: Verbindung weg, aber wir waren schon im Spiel
+    $app.appendChild(buildOfflineBanner());
+  }
 
+  if (!connected) {
+    if (!serverState) renderConnecting();
+    else renderGameOrLobby(); // mit Banner drüber
+    return;
+  }
+
+  if (!serverState) {
+    renderHome();
+    return;
+  }
+
+  renderGameOrLobby();
+}
+
+function renderGameOrLobby() {
   switch (serverState.phase) {
     case 'lobby':    renderLobby(); break;
     case 'placing':  renderPlacement(); break;
     case 'playing':
     case 'finished': renderGame(); break;
   }
+}
+
+function buildOfflineBanner() {
+  return el('div', { class: 'offline-banner' },
+    el('div', { class: 'offline-banner-inner' },
+      el('div', { class: 'dot offline-big' }),
+      el('div', null,
+        el('div', { class: 'offline-title' }, 'Verbindung verloren'),
+        el('div', { class: 'offline-sub' }, 'Versuche neu zu verbinden…')
+      )
+    )
+  );
 }
 
 function renderConnecting() {
@@ -386,7 +456,13 @@ function buildPlayerList(opts = {}) {
     `Spieler (${serverState.players.length})${serverState.spectatorCount ? ` · ${serverState.spectatorCount} 👁` : ''}`));
   for (const p of serverState.players) {
     const isMe = serverState.viewerKind === 'player' && p.id === serverState.yourId;
+    // Farb-Punkt mit Initial - so erkennt man den Spieler auch auf dem Spielfeld wieder
+    const colorDot = el('span', {
+      class: 'player-color-dot',
+      style: { background: p.color || '#fff' }
+    }, p.initial || '?');
     const row = el('div', { class: `player-row ${!p.alive ? 'dead' : ''} ${isMe ? 'me' : ''}` },
+      colorDot,
       el('span', { class: 'name' }, p.name + (isMe ? ' (du)' : '')),
       buildPlayerBadge(p, opts)
     );
@@ -396,17 +472,21 @@ function buildPlayerList(opts = {}) {
 }
 
 function buildPlayerBadge(p, opts) {
-  // Verschiedene Badges je nach Phase
-  if (!p.alive) return el('span', { class: 'badge dead' }, 'AUS');
-  if (!p.connected) return el('span', { class: 'badge disconnected' }, 'OFFLINE');
+  // Klare Farb-Semantik:
+  //   GRAU  = ausgeschieden / offline
+  //   ROT   = wartet (muss noch was tun)
+  //   GRÜN  = bereit / hat geschossen / Sieger
+
+  if (!p.alive) return el('span', { class: 'badge gray' }, 'AUS');
+  if (!p.connected) return el('span', { class: 'badge red' }, 'OFFLINE');
 
   if (serverState.phase === 'lobby') {
-    return el('span', { class: `badge ${p.ready ? 'ready' : 'waiting'}` },
+    return el('span', { class: `badge ${p.ready ? 'green' : 'red'}` },
       p.ready ? 'BEREIT' : 'WARTET');
   }
   if (serverState.phase === 'placing') {
-    return el('span', { class: `badge ${p.ready ? 'ready' : 'waiting'}` },
-      p.ready ? 'FERTIG' : 'PLATZIERT');
+    return el('span', { class: `badge ${p.ready ? 'green' : 'red'}` },
+      p.ready ? 'FERTIG' : 'PLATZIERT NOCH');
   }
   if (serverState.phase === 'playing') {
     // Steine-Bar zeigen (wie viele am Leben)
@@ -419,15 +499,15 @@ function buildPlayerBadge(p, opts) {
     const wrap = el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } });
     wrap.appendChild(stones);
     if (p.hasShotThisRound) {
-      wrap.appendChild(el('span', { class: 'badge shot' }, '✓'));
+      wrap.appendChild(el('span', { class: 'badge green' }, '✓ AB'));
     } else {
-      wrap.appendChild(el('span', { class: 'badge thinking' }, '…'));
+      wrap.appendChild(el('span', { class: 'badge red' }, 'WARTET'));
     }
     return wrap;
   }
   if (serverState.phase === 'finished') {
-    if (serverState.winner === p.name) return el('span', { class: 'badge ready' }, 'SIEGER');
-    return el('span', { class: 'badge dead' }, 'AUS');
+    if (serverState.winner === p.name) return el('span', { class: 'badge green' }, 'SIEGER');
+    return el('span', { class: 'badge gray' }, 'AUS');
   }
   return el('span', null);
 }
@@ -443,40 +523,50 @@ function renderPlacement() {
 
   const ready = serverState.yourReady;
   const others = serverState.players.filter(p => p.id !== serverState.yourId);
-  const othersReady = others.filter(p => p.ready).length;
+  const notReadyOthers = others.filter(p => !p.ready);
+  const remaining = SHIPS_PER_PLAYER - localShips.size;
 
-  screen.appendChild(el('div', { class: 'label-md' },
-    ready ? 'WARTE AUF ANDERE' : `SETZE ${SHIPS_PER_PLAYER} STEINE`));
+  // Layout: Hauptbereich + Seite mit Spielerliste
+  const layout = el('div', { class: 'game-layout' });
+  const main = el('div', { class: 'game-main' });
 
-  screen.appendChild(el('div', { class: 'spacer-sm' }));
+  main.appendChild(el('div', { class: 'label-md' },
+    ready ? 'WARTE AUF ANDERE SPIELER' : `SETZE ${SHIPS_PER_PLAYER} STEINE`));
+
+  main.appendChild(el('div', { class: 'spacer-sm' }));
 
   if (ready) {
-    screen.appendChild(el('p', { class: 'muted' },
-      `${othersReady} / ${others.length} andere Spieler haben platziert.`));
+    if (notReadyOthers.length === 0) {
+      main.appendChild(el('p', { class: 'muted' }, 'Spiel startet jeden Moment…'));
+    } else if (notReadyOthers.length === 1) {
+      main.appendChild(el('p', { class: 'muted' },
+        `Warte auf: ${notReadyOthers[0].name}`));
+    } else {
+      main.appendChild(el('p', { class: 'muted' },
+        `Warte auf: ${notReadyOthers.map(p => p.name).join(', ')}`));
+    }
   } else {
-    const remaining = SHIPS_PER_PLAYER - localShips.size;
-    screen.appendChild(el('p', { class: 'muted' },
+    main.appendChild(el('p', { class: 'muted' },
       remaining > 0 ? `Noch ${remaining} übrig` : 'Bereit zum Bestätigen'));
   }
 
-  screen.appendChild(el('div', { class: 'spacer-md' }));
+  main.appendChild(el('div', { class: 'spacer-md' }));
 
   // Board
   const ships = ready ? new Set(serverState.yourShips) : localShips;
   const board = buildOwnBoard(ships, !ready);
   const wrapper = el('div', { class: 'board-wrapper', style: { maxWidth: '540px' } }, board);
-  screen.appendChild(wrapper);
+  main.appendChild(wrapper);
 
-  screen.appendChild(el('div', { class: 'spacer-md' }));
+  main.appendChild(el('div', { class: 'spacer-md' }));
 
   if (!ready) {
     const canConfirm = localShips.size === SHIPS_PER_PLAYER;
-    screen.appendChild(el('div', { style: { display: 'flex', gap: '12px', flexWrap: 'wrap', justifyContent: 'center', width: '100%', maxWidth: '540px' } },
+    main.appendChild(el('div', { style: { display: 'flex', gap: '12px', flexWrap: 'wrap', justifyContent: 'center', width: '100%', maxWidth: '540px' } },
       el('button', {
         class: 'btn btn-secondary',
         style: { maxWidth: '180px' },
         onclick: () => {
-          // Zufällig setzen
           localShips.clear();
           while (localShips.size < SHIPS_PER_PLAYER) {
             const r = Math.floor(Math.random() * BOARD_SIZE);
@@ -495,7 +585,23 @@ function renderPlacement() {
     ));
   }
 
+  layout.appendChild(main);
+
+  // Seitenleiste: Spielerliste mit Status
+  const side = el('div', { class: 'game-side' });
+  side.appendChild(buildPlayerList());
+  layout.appendChild(side);
+
+  screen.appendChild(layout);
   $app.appendChild(screen);
+}
+
+function buildWaitNotice(text, kind) {
+  // kind: 'highlight' (du bist dran / aktiv) oder 'waiting' (auf andere warten)
+  return el('div', { class: `wait-notice ${kind}` },
+    el('span', { class: 'wait-notice-icon' }, kind === 'highlight' ? '➜' : '⌛'),
+    el('span', { class: 'wait-notice-text' }, text)
+  );
 }
 
 function buildOwnBoard(ships, interactive) {
@@ -532,17 +638,36 @@ function renderGame() {
     const overlay = el('div', { class: 'pause-overlay' },
       el('div', { class: 'label-md' }, 'PAUSE'),
       el('h1', { class: 'title' }, `${serverState.pausedFor} verbindet neu`),
-      el('div', { class: 'countdown' }, fmtTime(serverState.pauseTimeLeft)),
+      el('div', { class: 'countdown', 'data-countdown': 'pause' }, fmtTime(getPauseTimeLeft())),
       el('p', { class: 'muted' }, 'Wenn die Verbindung nicht zurückkehrt, scheidet der Spieler aus.')
     );
-    document.body.appendChild(overlay);
-    setTimeout(() => overlay.remove(), 50); // wird im nächsten Render neu gemalt
-    // Damit das Overlay bleibt, fügen wir es ans #app an
-    document.body.removeChild(overlay);
     $app.appendChild(overlay);
   }
 
   screen.appendChild(buildStatusBar());
+
+  // Hinweis nur für den aktuellen Spieler: "Du bist dran" oder "Geschossen, warte"
+  // Die genauen Namen wer noch fehlt sieht man in der Spielerliste rechts (rot/grün)
+  if (serverState.phase === 'playing' && !serverState.paused && serverState.viewerKind === 'player') {
+    const me = serverState.players.find(p => p.id === serverState.yourId);
+    if (me && me.alive) {
+      if (!me.hasShotThisRound) {
+        screen.appendChild(buildWaitNotice(
+          'Du bist dran — schieß ein Feld auf dem Angriffsfeld an',
+          'highlight'
+        ));
+      } else {
+        const others = serverState.players.filter(p => p.alive && p.connected && p.id !== me.id);
+        const stillWaiting = others.filter(p => !p.hasShotThisRound);
+        if (stillWaiting.length > 0) {
+          screen.appendChild(buildWaitNotice(
+            `Geschossen ✓ — noch ${stillWaiting.length} ${stillWaiting.length === 1 ? 'Spieler' : 'Spieler'} aktiv`,
+            'waiting'
+          ));
+        }
+      }
+    }
+  }
 
   // Reveal-Banner wenn vorhanden
   if (serverState.lastReveal && serverState.lastReveal.round) {
@@ -595,8 +720,11 @@ function buildStatusBar() {
     right.appendChild(el('span', { class: 'label-sm' }, 'PLATZIERUNG'));
   } else if (serverState.phase === 'playing') {
     right.appendChild(el('span', { class: 'label-sm' }, `RUNDE ${serverState.roundNumber}`));
-    const time = serverState.roundTimeLeft;
-    const cd = el('span', { class: `countdown ${time < 10000 ? 'urgent' : ''}` }, fmtTime(time));
+    const time = getRoundTimeLeft();
+    const cd = el('span', {
+      class: `countdown ${time < 10000 ? 'urgent' : ''}`,
+      'data-countdown': 'round'
+    }, fmtTime(time));
     right.appendChild(cd);
   } else if (serverState.phase === 'finished') {
     right.appendChild(el('span', { class: 'label-sm' },
@@ -645,10 +773,10 @@ function buildGameBoards() {
   if (serverState.phase === 'playing') {
     if (serverState.viewerKind === 'player') {
       atkLabel = serverState.yourShotThisRound
-        ? `ANGRIFF  •  Wartet auf andere…`
+        ? `ANGRIFF  •  Geschossen ✓`
         : `ANGRIFF  •  Klick ein Feld`;
     } else {
-      atkLabel = `ANGRIFF  •  Schüsse werden eingesammelt`;
+      atkLabel = `ANGRIFF  •  ${serverState.roundShots?.length || 0} Schüsse abgegeben`;
     }
   } else if (serverState.phase === 'finished') {
     atkLabel = `ANGRIFF  •  Spielende — alle Steine aufgedeckt`;
@@ -662,61 +790,120 @@ function buildGameBoards() {
     style: { gridTemplateColumns: `repeat(${BOARD_SIZE}, 1fr)` }
   });
 
-  // Daten-Sammeln
-  const myShot = serverState.yourShotThisRound;
+  // ===== Daten-Sammeln =====
+
+  // 1) Schüsse der LAUFENDEN Runde (Initial+Farbe, ohne Treffer-Info)
+  // Wir sammeln pro Zelle die Liste der Schützen
+  const currentRoundShots = new Map(); // cell -> [{initial, color, name}]
+  for (const s of (serverState.roundShots || [])) {
+    if (!currentRoundShots.has(s.cell)) currentRoundShots.set(s.cell, []);
+    currentRoundShots.get(s.cell).push({
+      initial: s.shooterInitial,
+      color: s.shooterColor,
+      name: s.shooterName
+    });
+  }
+
+  // 2) Aufgelöste Schüsse (lastReveal) - Treffer/Miss + Schützen-Info
   const reveal = serverState.lastReveal;
-  const allHits = new Map(); // cell -> count
-  const allMisses = new Set();
+  const revealedHits = new Map();   // cell -> {shooters: [...], victims: [...]}
+  const revealedMisses = new Map(); // cell -> {shooters: [...]}
   if (reveal && reveal.shots) {
     for (const s of reveal.shots) {
-      if (s.hitCount > 0) allHits.set(s.cell, s.hitCount);
-      else allMisses.add(s.cell);
+      const shooter = { initial: s.shooterInitial, color: s.shooterColor, name: s.shooterName };
+      if (s.hitCount > 0) {
+        if (!revealedHits.has(s.cell)) revealedHits.set(s.cell, { shooters: [], victims: [] });
+        const entry = revealedHits.get(s.cell);
+        entry.shooters.push(shooter);
+        for (const h of s.hits) {
+          entry.victims.push({ name: h.playerName, color: h.playerColor });
+        }
+      } else {
+        if (!revealedMisses.has(s.cell)) revealedMisses.set(s.cell, { shooters: [] });
+        revealedMisses.get(s.cell).shooters.push(shooter);
+      }
     }
   }
 
-  // Bei Spielende: alle Schiffe revealen
-  let allShipsCells = null;
+  // 3) Bei Spielende: alle Schiffe pro Spieler aufgedeckt
+  const revealedShipsByCell = new Map(); // cell -> [{name, color}]
   if (serverState.phase === 'finished' && serverState.allShipsRevealed) {
-    allShipsCells = new Set();
     for (const player of serverState.allShipsRevealed) {
-      for (const s of player.ships) allShipsCells.add(s);
+      const meta = serverState.players.find(p => p.name === player.name);
+      const color = meta?.color || '#FFFFFF';
+      for (const s of player.ships) {
+        if (!revealedShipsByCell.has(s)) revealedShipsByCell.set(s, []);
+        revealedShipsByCell.get(s).push({ name: player.name, color });
+      }
     }
   }
+
+  // ===== Status pro Zelle bestimmen =====
 
   const isPlayer = serverState.viewerKind === 'player';
   const isPlaying = serverState.phase === 'playing';
   const myAlive = serverState.yourAlive !== false;
-  const canShoot = isPlayer && isPlaying && myAlive && !myShot && !serverState.paused;
+  const myShot = serverState.yourShotThisRound;
 
   for (let r = 0; r < BOARD_SIZE; r++) {
     for (let c = 0; c < BOARD_SIZE; c++) {
       const key = `${r},${c}`;
-      let cls = 'cell';
-      let marker = false;
-      let multi = null;
-      let extraText = null;
+      const inCurrentRound = currentRoundShots.has(key);
+      const wasHit = revealedHits.has(key);
+      const wasMiss = revealedMisses.has(key);
+      const hasShips = revealedShipsByCell.has(key);
 
-      if (allShipsCells && allShipsCells.has(key)) {
-        // Spielende: aufgedeckte Schiffe
-        cls += ' own-ship'; marker = true;
+      // Klick erlaubt wenn: spielen, ich lebe, ich hab nicht geschossen,
+      //                    NICHT pausiert, Zelle in dieser Runde noch nicht beschossen
+      const canShootHere = isPlayer && isPlaying && myAlive && !myShot
+        && !serverState.paused && !inCurrentRound;
+
+      let cls = 'cell';
+      const children = [];
+
+      // === Reveal-Anzeige (höchste Priorität) ===
+      if (wasHit) {
+        cls += ' hit';
+        const entry = revealedHits.get(key);
+        // Großer roter Treffer-Punkt
+        children.push(el('div', { class: 'marker' }));
+        // Schützen-Initialen oben
+        if (entry.shooters.length > 0) {
+          children.push(buildShooterDots(entry.shooters, 'top'));
+        }
+        // Multiplikator wenn mehrere Steine getroffen
+        const totalVictims = entry.victims.length;
+        if (totalVictims > 1) {
+          children.push(el('div', { class: 'multiplier' }, `×${totalVictims}`));
+        }
+      } else if (wasMiss) {
+        cls += ' miss';
+        children.push(el('div', { class: 'marker' }));
+        const entry = revealedMisses.get(key);
+        if (entry.shooters.length > 0) {
+          children.push(buildShooterDots(entry.shooters, 'top'));
+        }
       }
-      if (allHits.has(key)) {
-        cls = 'cell hit'; marker = true;
-        const count = allHits.get(key);
-        if (count > 1) multi = `×${count}`;
-      } else if (allMisses.has(key)) {
-        cls = 'cell miss'; marker = true;
+      // === Aktuelle Runde: Schuss platziert (noch nicht aufgelöst) ===
+      else if (inCurrentRound) {
+        cls += ' shot-pending';
+        // Schützen-Initialen anzeigen
+        const shooters = currentRoundShots.get(key);
+        children.push(buildShooterDots(shooters, 'center'));
       }
-      if (myShot === key && !allHits.has(key) && !allMisses.has(key)) {
-        cls = 'cell my-shot-pending'; marker = true;
+      // === Spielende: aufgedeckte Schiffe (die nicht getroffen wurden) ===
+      else if (hasShips) {
+        cls += ' own-ship';
+        const shipOwners = revealedShipsByCell.get(key);
+        children.push(buildOwnershipDot(shipOwners));
       }
-      if (!canShoot) cls += ' disabled';
+
+      if (!canShootHere) cls += ' disabled';
 
       const cellEl = el('div', { class: cls });
-      if (marker) cellEl.appendChild(el('div', { class: 'marker' }));
-      if (multi) cellEl.appendChild(el('div', { class: 'multiplier' }, multi));
+      for (const ch of children) cellEl.appendChild(ch);
 
-      if (canShoot) {
+      if (canShootHere) {
         cellEl.addEventListener('click', () => send('shoot', { cell: key }));
       }
       board.appendChild(cellEl);
@@ -726,6 +913,47 @@ function buildGameBoards() {
   row.appendChild(atkWrap);
 
   return row;
+}
+
+// ----- Helper: kleine farbige Punkte mit Initial der Schützen -----
+function buildShooterDots(shooters, position) {
+  const wrap = el('div', { class: `shooter-dots ${position}` });
+  // Maximal 4 zeigen, sonst überfüllt
+  const visible = shooters.slice(0, 4);
+  for (const s of visible) {
+    const dot = el('div', {
+      class: 'shooter-dot',
+      style: { background: s.color },
+      title: s.name
+    }, s.initial);
+    wrap.appendChild(dot);
+  }
+  if (shooters.length > 4) {
+    wrap.appendChild(el('div', { class: 'shooter-dot more' }, `+${shooters.length - 4}`));
+  }
+  return wrap;
+}
+
+// ----- Helper: Aufgedeckter Stein zeigt Besitzer-Farbe -----
+function buildOwnershipDot(owners) {
+  if (!owners || owners.length === 0) return el('div', { class: 'marker' });
+  if (owners.length === 1) {
+    return el('div', {
+      class: 'marker',
+      style: { background: owners[0].color },
+      title: owners[0].name
+    });
+  }
+  // Mehrere Besitzer auf einem Feld: gestreift
+  const wrap = el('div', { class: 'marker multi-owner' });
+  for (const o of owners.slice(0, 4)) {
+    wrap.appendChild(el('div', {
+      class: 'marker-stripe',
+      style: { background: o.color },
+      title: o.name
+    }));
+  }
+  return wrap;
 }
 
 function buildRevealBanner(reveal) {
@@ -738,15 +966,34 @@ function buildRevealBanner(reveal) {
   }
   for (const s of (reveal.shots || [])) {
     const item = el('div', { class: 'reveal-item' });
+    // Schützen-Punkt mit Farbe
+    item.appendChild(el('span', {
+      class: 'reveal-shooter-dot',
+      style: { background: s.shooterColor || '#fff' }
+    }, s.shooterInitial || '?'));
     item.appendChild(el('span', { class: 'shooter' }, s.shooterName));
     item.appendChild(el('span', { class: 'arrow' }, '→'));
     item.appendChild(el('span', { class: 'target-cell' }, s.cell));
     if (s.hitCount > 0) {
-      const names = s.hits.map(h => h.playerName).join(', ');
       const t = s.hitCount > 1
-        ? `TREFFER ×${s.hitCount} (${names})`
-        : `TREFFER (${names})`;
+        ? `TREFFER ×${s.hitCount}`
+        : `TREFFER`;
       item.appendChild(el('span', { class: 'result hit' }, t));
+      // Opfer einzeln mit Farb-Punkten
+      const victimsWrap = el('span', { class: 'victims' });
+      for (const h of s.hits) {
+        victimsWrap.appendChild(el('span', {
+          class: 'victim-tag',
+          style: { borderColor: h.playerColor || '#fff' }
+        },
+          el('span', {
+            class: 'victim-dot',
+            style: { background: h.playerColor || '#fff' }
+          }),
+          h.playerName
+        ));
+      }
+      item.appendChild(victimsWrap);
     } else {
       item.appendChild(el('span', { class: 'result miss' }, 'DANEBEN'));
     }
@@ -766,6 +1013,15 @@ function renderSpectatorWaiting(text) {
   screen.appendChild(el('div', { class: 'spacer-lg' }));
   screen.appendChild(el('div', { class: 'label-md' }, 'ZUSCHAUER-MODUS'));
   screen.appendChild(el('h2', { class: 'subtitle' }, text));
+
+  // Wartet auf welche Spieler? (in der Platzierungs-Phase)
+  const notReady = serverState.players.filter(p => !p.ready);
+  if (notReady.length > 0 && serverState.phase === 'placing') {
+    screen.appendChild(el('div', { class: 'spacer-sm' }));
+    screen.appendChild(el('p', { class: 'muted' },
+      `Warte auf: ${notReady.map(p => p.name).join(', ')}`));
+  }
+
   screen.appendChild(el('div', { class: 'spacer-md' }));
   screen.appendChild(buildPlayerList());
   screen.appendChild(el('div', { class: 'spacer-md' }));
