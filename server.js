@@ -81,13 +81,13 @@ function buildRoomStateFor(room, viewerId, viewerKind) {
   const players = Array.from(room.players.values()).map(publicPlayerInfo);
   const spectatorCount = room.spectators.size;
 
-  const roundTimeLeft = (room.phase === 'playing' && room.roundStartTime)
-    ? Math.max(0, ROUND_DURATION_MS - (Date.now() - room.roundStartTime))
-    : 0;
+  // Statt Restzeit zu schicken, schicken wir absoluten End-Zeitstempel.
+  // Der Client zählt lokal runter -> kein UI-Flackern jede Sekunde nötig.
+  const roundEndsAt = (room.phase === 'playing' && room.roundStartTime)
+    ? room.roundStartTime + ROUND_DURATION_MS
+    : null;
 
-  const pauseTimeLeft = room.pauseUntil
-    ? Math.max(0, room.pauseUntil - Date.now())
-    : 0;
+  const pauseEndsAt = room.pauseUntil || null;
 
   const base = {
     code: room.code,
@@ -95,9 +95,10 @@ function buildRoomStateFor(room, viewerId, viewerKind) {
     players,
     spectatorCount,
     roundNumber: room.roundNumber,
-    roundTimeLeft,
+    roundEndsAt,
     paused: room.pauseUntil != null,
-    pauseTimeLeft,
+    pauseEndsAt,
+    serverTime: Date.now(),
     pausedFor: room.pausedFor || null,
     winner: room.winner || null,
     viewerKind,
@@ -202,14 +203,9 @@ function startRound(room) {
 }
 
 function scheduleCountdownTick(room) {
-  if (room.tickTimer) clearTimeout(room.tickTimer);
-  if (room.phase !== 'playing') return;
-  room.tickTimer = setTimeout(() => {
-    if (room.phase === 'playing' && !room.pauseUntil) {
-      broadcastRoom(room);
-      scheduleCountdownTick(room);
-    }
-  }, 1000);
+  // Nicht mehr nötig — Client zählt lokal runter mit absoluten Zeitstempeln (roundEndsAt).
+  // Wir broadcasten nur noch bei echten State-Änderungen (Schuss, Beitritt, etc.),
+  // nicht jede Sekunde. Verhindert UI-Flackern.
 }
 
 function resolveRound(room) {
@@ -315,14 +311,7 @@ function pauseRoom(room, playerName) {
 }
 
 function schedulePauseCountdownTick(room) {
-  if (room.tickTimer) clearTimeout(room.tickTimer);
-  if (!room.pauseUntil) return;
-  room.tickTimer = setTimeout(() => {
-    if (room.pauseUntil) {
-      broadcastRoom(room);
-      schedulePauseCountdownTick(room);
-    }
-  }, 1000);
+  // Nicht mehr nötig — Client zählt lokal runter, sieht pauseEndsAt im State.
 }
 
 function endPause(room, eliminateDisconnected) {
