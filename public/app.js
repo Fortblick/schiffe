@@ -456,11 +456,9 @@ function buildPlayerList(opts = {}) {
     `Spieler (${serverState.players.length})${serverState.spectatorCount ? ` · ${serverState.spectatorCount} 👁` : ''}`));
   for (const p of serverState.players) {
     const isMe = serverState.viewerKind === 'player' && p.id === serverState.yourId;
-    // Farb-Punkt mit Initial - so erkennt man den Spieler auch auf dem Spielfeld wieder
-    const colorDot = el('span', {
-      class: 'player-color-dot',
-      style: { background: p.color || '#fff' }
-    }, p.initial || '?');
+    // Farb-Punkt mit Initial - direkt inline gestylt
+    const colorDot = el('span', { class: 'player-color-dot' }, p.initial || '?');
+    colorDot.style.background = p.color || '#fff';
     const row = el('div', { class: `player-row ${!p.alive ? 'dead' : ''} ${isMe ? 'me' : ''}` },
       colorDot,
       el('span', { class: 'name' }, p.name + (isMe ? ' (du)' : '')),
@@ -852,6 +850,7 @@ function buildGameBoards() {
       const wasHit = revealedHits.has(key);
       const wasMiss = revealedMisses.has(key);
       const hasShips = revealedShipsByCell.has(key);
+      const isMyShot = serverState.yourShotThisRound === key;
 
       // Klick erlaubt wenn: spielen, ich lebe, ich hab nicht geschossen,
       //                    NICHT pausiert, Zelle in dieser Runde noch nicht beschossen
@@ -865,37 +864,52 @@ function buildGameBoards() {
       if (wasHit) {
         cls += ' hit';
         const entry = revealedHits.get(key);
-        // Großer roter Treffer-Punkt
         children.push(el('div', { class: 'marker' }));
-        // Schützen-Initialen oben
-        if (entry.shooters.length > 0) {
-          children.push(buildShooterDots(entry.shooters, 'top'));
-        }
         // Multiplikator wenn mehrere Steine getroffen
-        const totalVictims = entry.victims.length;
-        if (totalVictims > 1) {
-          children.push(el('div', { class: 'multiplier' }, `×${totalVictims}`));
+        if (entry.victims.length > 1) {
+          children.push(el('div', { class: 'multiplier' }, `×${entry.victims.length}`));
+        }
+        // Schütze als kleine Initiale oben links (Zuordnung zum Schützen)
+        if (entry.shooters.length === 1) {
+          const tag = el('div', { class: 'shooter-tag' }, entry.shooters[0].initial);
+          tag.style.background = entry.shooters[0].color;
+          tag.title = entry.shooters[0].name;
+          children.push(tag);
+        } else if (entry.shooters.length > 1) {
+          const tag = el('div', { class: 'shooter-tag' }, entry.shooters.length);
+          tag.style.background = '#FFFFFF';
+          tag.title = entry.shooters.map(s => s.name).join(', ');
+          children.push(tag);
         }
       } else if (wasMiss) {
         cls += ' miss';
         children.push(el('div', { class: 'marker' }));
+        // Auch beim Fehlschuss: Schütze klein zeigen
         const entry = revealedMisses.get(key);
-        if (entry.shooters.length > 0) {
-          children.push(buildShooterDots(entry.shooters, 'top'));
+        if (entry.shooters.length === 1) {
+          const tag = el('div', { class: 'shooter-tag' }, entry.shooters[0].initial);
+          tag.style.background = entry.shooters[0].color;
+          tag.title = entry.shooters[0].name;
+          children.push(tag);
+        } else if (entry.shooters.length > 1) {
+          const tag = el('div', { class: 'shooter-tag' }, entry.shooters.length);
+          tag.style.background = '#FFFFFF';
+          tag.title = entry.shooters.map(s => s.name).join(', ');
+          children.push(tag);
         }
       }
       // === Aktuelle Runde: Schuss platziert (noch nicht aufgelöst) ===
       else if (inCurrentRound) {
         cls += ' shot-pending';
-        // Schützen-Initialen anzeigen
+        if (isMyShot) cls += ' my-shot';
         const shooters = currentRoundShots.get(key);
-        children.push(buildShooterDots(shooters, 'center'));
+        children.push(buildPendingMarker(shooters));
       }
       // === Spielende: aufgedeckte Schiffe (die nicht getroffen wurden) ===
       else if (hasShips) {
         cls += ' own-ship';
         const shipOwners = revealedShipsByCell.get(key);
-        children.push(buildOwnershipDot(shipOwners));
+        children.push(buildOwnershipMarker(shipOwners));
       }
 
       if (!canShootHere) cls += ' disabled';
@@ -915,45 +929,53 @@ function buildGameBoards() {
   return row;
 }
 
-// ----- Helper: kleine farbige Punkte mit Initial der Schützen -----
-function buildShooterDots(shooters, position) {
-  const wrap = el('div', { class: `shooter-dots ${position}` });
-  // Maximal 4 zeigen, sonst überfüllt
-  const visible = shooters.slice(0, 4);
+// ----- Helper: Pending-Schuss-Marker (während laufender Runde) -----
+// Zeigt nur einen kleinen Farbpunkt, mehrere -> nebeneinander
+function buildPendingMarker(shooters) {
+  const visible = shooters.slice(0, 3);
+  const wrap = el('div', { class: 'pending-marker-wrap' });
   for (const s of visible) {
     const dot = el('div', {
-      class: 'shooter-dot',
-      style: { background: s.color },
+      class: 'pending-dot',
       title: s.name
-    }, s.initial);
+    });
+    dot.style.background = s.color;
     wrap.appendChild(dot);
-  }
-  if (shooters.length > 4) {
-    wrap.appendChild(el('div', { class: 'shooter-dot more' }, `+${shooters.length - 4}`));
   }
   return wrap;
 }
 
-// ----- Helper: Aufgedeckter Stein zeigt Besitzer-Farbe -----
-function buildOwnershipDot(owners) {
+// ----- Helper: Treffer-Marker mit Schützen-Farben -----
+// Großer roter Hintergrund, dazu kleine farbige Punkte für Schützen (oben)
+function buildHitMarker(shooters, victimCount) {
+  // Hauptmarker: roter Punkt
+  const main = el('div', { class: 'marker' });
+  return main;
+}
+
+// ----- Helper: aufgedeckter Stein (Spielende) mit Besitzerfarbe -----
+function buildOwnershipMarker(owners) {
   if (!owners || owners.length === 0) return el('div', { class: 'marker' });
+  const m = el('div', { class: 'marker' });
+  // Bei einem Besitzer: Hintergrundfarbe des Markers
   if (owners.length === 1) {
-    return el('div', {
-      class: 'marker',
-      style: { background: owners[0].color },
-      title: owners[0].name
-    });
+    m.style.background = owners[0].color;
+    m.title = owners[0].name;
+  } else {
+    // Mehrere Besitzer: gestreift über mehrere Punkte
+    m.style.background = 'transparent';
+    m.style.display = 'flex';
+    m.style.gap = '1px';
+    for (const o of owners.slice(0, 3)) {
+      const stripe = el('div', { title: o.name });
+      stripe.style.flex = '1';
+      stripe.style.height = '100%';
+      stripe.style.borderRadius = '50%';
+      stripe.style.background = o.color;
+      m.appendChild(stripe);
+    }
   }
-  // Mehrere Besitzer auf einem Feld: gestreift
-  const wrap = el('div', { class: 'marker multi-owner' });
-  for (const o of owners.slice(0, 4)) {
-    wrap.appendChild(el('div', {
-      class: 'marker-stripe',
-      style: { background: o.color },
-      title: o.name
-    }));
-  }
-  return wrap;
+  return m;
 }
 
 function buildRevealBanner(reveal) {
@@ -966,32 +988,26 @@ function buildRevealBanner(reveal) {
   }
   for (const s of (reveal.shots || [])) {
     const item = el('div', { class: 'reveal-item' });
-    // Schützen-Punkt mit Farbe
-    item.appendChild(el('span', {
-      class: 'reveal-shooter-dot',
-      style: { background: s.shooterColor || '#fff' }
-    }, s.shooterInitial || '?'));
+    // Schützen-Punkt — alles inline gestylt damit nichts schiefgeht
+    const dot = el('span', { class: 'reveal-shooter-dot' }, s.shooterInitial || '?');
+    dot.style.background = s.shooterColor || '#fff';
+    item.appendChild(dot);
     item.appendChild(el('span', { class: 'shooter' }, s.shooterName));
     item.appendChild(el('span', { class: 'arrow' }, '→'));
     item.appendChild(el('span', { class: 'target-cell' }, s.cell));
     if (s.hitCount > 0) {
-      const t = s.hitCount > 1
-        ? `TREFFER ×${s.hitCount}`
-        : `TREFFER`;
+      const t = s.hitCount > 1 ? `TREFFER ×${s.hitCount}` : `TREFFER`;
       item.appendChild(el('span', { class: 'result hit' }, t));
       // Opfer einzeln mit Farb-Punkten
       const victimsWrap = el('span', { class: 'victims' });
       for (const h of s.hits) {
-        victimsWrap.appendChild(el('span', {
-          class: 'victim-tag',
-          style: { borderColor: h.playerColor || '#fff' }
-        },
-          el('span', {
-            class: 'victim-dot',
-            style: { background: h.playerColor || '#fff' }
-          }),
-          h.playerName
-        ));
+        const tag = el('span', { class: 'victim-tag' });
+        tag.style.borderColor = h.playerColor || '#fff';
+        const vdot = el('span', { class: 'victim-dot' });
+        vdot.style.background = h.playerColor || '#fff';
+        tag.appendChild(vdot);
+        tag.appendChild(document.createTextNode(h.playerName));
+        victimsWrap.appendChild(tag);
       }
       item.appendChild(victimsWrap);
     } else {
